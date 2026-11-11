@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DartLab 飛鏢投擲分析</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg viewBox="0 0 32 32" width="28" height="28" aria-hidden="true"><circle cx="16" cy="16" r="14" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="16" cy="16" r="8" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="16" cy="16" r="2.5" fill="currentColor"/></svg>
+    <div><b>DartLab</b><span>飛鏢投擲分析</span></div>
+  </div>
+  <div class="chips">
+    <span class="chip" id="chipPose">姿勢鏡頭：未啟動</span>
+    <span class="chip" id="chipBoard">靶面鏡頭：未啟動</span>
+    <span class="chip" id="chipModel">姿勢模型：未載入</span>
+  </div>
+  <div class="actions">
+    <button id="btnNewSession" class="ghost" title="開始新的練習回合">新練習</button>
+    <button id="btnSettings" class="ghost">設定</button>
+    <button id="btnHelp" class="ghost">使用說明</button>
+  </div>
+</header>
+
+<main class="live">
+  <section class="cams">
+    <article class="panel cam" id="posePanel">
+      <div class="panel-head">
+        <h2>姿勢鏡頭 <small>從投擲手側面拍攝全身上半部</small></h2>
+        <div class="ctrls">
+          <select id="poseDevice" aria-label="姿勢鏡頭裝置"><option value="">預設攝影機</option></select>
+          <select id="poseRes" class="compact" aria-label="解析度" title="姿勢分析 720p 就足夠，解析度越高越耗效能"><option value="640x480">480p</option><option value="1280x720">720p</option><option value="1920x1080">1080p</option></select>
+          <select id="poseFps" class="compact" aria-label="FPS" title="FPS 越高，出手時間與角速度量得越準（建議優先提高 FPS）"><option value="30">30fps</option><option value="60">60fps</option><option value="90">90fps</option><option value="120">120fps</option></select>
+          <button id="poseStart" class="primary">啟動鏡頭</button>
+          <label class="btn ghost">影片檔<input type="file" id="poseFile" accept="video/*" hidden></label>
+        </div>
+      </div>
+      <div class="caminfo" id="poseCamInfo"></div>
+      <div class="stage" id="poseStage">
+        <video id="poseVideo" playsinline muted></video>
+        <canvas id="poseOverlay"></canvas>
+        <div class="placeholder">
+          <p>啟動攝影機或載入影片檔</p>
+          <small>鏡頭放在投擲手那一側、與投擲方向垂直，畫面中要看得到肩、手肘、手腕與頭部。<br>手機 120/240fps 慢動作影片可得到更精準的時間分析。</small>
+        </div>
+        <div class="flash" id="poseFlash"></div>
+      </div>
+      <div class="filebar" id="poseFilebar" hidden>
+        <button id="posePlay" class="ghost small">暫停</button>
+        <input type="range" id="poseSeek" min="0" max="1000" value="0" aria-label="影片進度">
+        <select id="poseRate" aria-label="播放速度"><option value="0.25">0.25×</option><option value="0.5" selected>0.5×</option><option value="1">1×</option></select>
+        <span class="muted" id="poseTime">0.0s</span>
+      </div>
+      <div class="strip">
+        <div><span>投擲手</span><b id="lvSide">—</b></div>
+        <div><span>手肘角</span><b id="lvAngle">—</b></div>
+        <div><span>角速度</span><b id="lvVel">—</b></div>
+        <div><span>階段</span><b id="lvPhase">—</b></div>
+        <div><span>分析 FPS</span><b id="lvFps">—</b></div>
+        <div class="meter"><span>手肘角</span><i><em id="lvBar"></em></i></div>
+      </div>
+    </article>
+
+    <article class="panel cam" id="boardPanel">
+      <div class="panel-head">
+        <h2>靶面鏡頭 <small>正對鏢靶，自動偵測落點</small></h2>
+        <div class="ctrls">
+          <select id="boardDevice" aria-label="靶面鏡頭裝置"><option value="">預設攝影機</option></select>
+          <select id="boardRes" class="compact" aria-label="解析度" title="解析度越高，落點定位越精準"><option value="640x480">480p</option><option value="1280x720">720p</option><option value="1920x1080">1080p</option></select>
+          <select id="boardFps" class="compact" aria-label="FPS" title="靶面偵測 30fps 即可"><option value="30">30fps</option><option value="60">60fps</option><option value="90">90fps</option><option value="120">120fps</option></select>
+          <button id="boardStart" class="primary">啟動鏡頭</button>
+          <label class="btn ghost">影片檔<input type="file" id="boardFile" accept="video/*" hidden></label>
+        </div>
+      </div>
+      <div class="caminfo" id="boardCamInfo"></div>
+      <div class="stage" id="boardStage">
+        <video id="boardVideo" playsinline muted></video>
+        <canvas id="boardOverlay" class="interactive"></canvas>
+        <div class="placeholder">
+          <p>啟動第二支攝影機對準鏢靶</p>
+          <small>沒有第二支鏡頭也沒關係：可以在下方「落點分佈」靶面圖上直接點擊記錄落點。</small>
+        </div>
+        <div class="flash" id="boardFlash"></div>
+      </div>
+      <div class="strip board-strip">
+        <button id="btnCalib" class="ghost small" disabled>校正靶面</button>
+        <button id="btnCalibDone" class="primary small" hidden>完成校正</button>
+        <button id="btnPull" class="ghost small" disabled title="快捷鍵 R">拔鏢 / 重設背景</button>
+        <label class="toggle"><input type="checkbox" id="autoDetect" checked> 自動偵測</label>
+        <span class="status" id="boardStatus">尚未啟動</span>
+      </div>
+    </article>
+  </section>
+
+  <aside class="side">
+    <article class="panel latest">
+      <div class="panel-head"><h2>最新一投</h2><span class="muted" id="latestTime"></span></div>
+      <div class="latest-body" id="latestBody"><p class="muted">還沒有投擲紀錄。</p></div>
+    </article>
+    <article class="panel list">
+      <div class="panel-head"><h2>投擲紀錄 <small id="listCount"></small></h2>
+        <div class="ctrls"><button id="btnUndo" class="ghost small" title="刪除最後一筆">復原</button></div>
+      </div>
+      <div class="table-wrap">
+        <table class="throws">
+          <thead><tr><th>#</th><th>落點</th><th>分</th><th>出手角</th><th>延伸</th><th>肘位移</th><th></th></tr></thead>
+          <tbody id="throwRows"></tbody>
+        </table>
+      </div>
+    </article>
+  </aside>
+</main>
+
+<section class="analysis">
+  <div class="analysis-head">
+    <h2>詳細分析</h2>
+    <div class="ctrls">
+      <label>範圍 <select id="scope">
+        <option value="session">本次練習</option>
+        <option value="last30">最近 30 投</option>
+        <option value="last90">最近 90 投</option>
+        <option value="all">全部歷史</option>
+      </select></label>
+      <label>目標 <select id="target"></select></label>
+      <button id="btnExportCsv" class="ghost small">匯出 CSV</button>
+      <button id="btnExportJson" class="ghost small">匯出 JSON</button>
+      <label class="btn ghost small">匯入<input type="file" id="importFile" accept="application/json" hidden></label>
+    </div>
+  </div>
+
+  <div class="cards" id="summaryCards"></div>
+
+  <div class="grid2">
+    <article class="panel">
+      <div class="panel-head"><h2>落點分佈 <small>十字 = 平均落點，橢圓 = 1σ / 2σ 散佈</small></h2>
+        <div class="ctrls">
+          <label class="toggle"><input type="checkbox" id="zoomPlot" checked> 放大落點區</label>
+          <label class="toggle"><input type="checkbox" id="manualMark"> 點擊靶面手動記錄</label>
+        </div>
+      </div>
+      <div class="boardplot-wrap">
+        <svg id="boardPlot" class="boardplot"></svg>
+      </div>
+      <div class="legend" id="boardLegend"></div>
+    </article>
+    <article class="panel">
+      <div class="panel-head"><h2>集團性 / 得分</h2></div>
+      <div id="groupStats" class="kv"></div>
+      <h3 class="sub">最常落點</h3>
+      <div id="topLabels" class="bars"></div>
+    </article>
+  </div>
+
+  <article class="panel">
+    <div class="panel-head"><h2>投擲動作指標 <small>平均 ± 標準差；變異係數越小代表越一致</small></h2></div>
+    <div class="table-wrap">
+      <table class="metrics">
+        <thead><tr><th>指標</th><th>平均</th><th>標準差</th><th>一致性</th><th>最新</th><th>最小 – 最大</th><th>說明</th></tr></thead>
+        <tbody id="metricRows"></tbody>
+      </table>
+    </div>
+  </article>
+
+  <div class="grid2">
+    <article class="panel">
+      <div class="panel-head"><h2>手肘角度曲線 <small>以出手瞬間對齊；細線 = 各投，粗線 = 最新，金線 = 平均</small></h2></div>
+      <canvas id="chartCurves" class="chart"></canvas>
+    </article>
+    <article class="panel">
+      <div class="panel-head"><h2>指標趨勢</h2>
+        <select id="trendMetric" aria-label="趨勢指標"></select>
+      </div>
+      <canvas id="chartTrend" class="chart"></canvas>
+    </article>
+  </div>
+
+  <div class="grid2">
+    <article class="panel">
+      <div class="panel-head"><h2>動作 × 落點關聯</h2>
+        <div class="ctrls">
+          <select id="corrMetric" aria-label="動作指標"></select>
+          <select id="corrAxis" aria-label="落點誤差方向"><option value="up">垂直誤差（上 +）</option><option value="right">水平誤差（右 +）</option><option value="radial">與目標距離</option></select>
+        </div>
+      </div>
+      <canvas id="chartCorr" class="chart"></canvas>
+      <p class="muted small" id="corrNote"></p>
+    </article>
+    <article class="panel">
+      <div class="panel-head"><h2>相關係數總覽 <small>需同時有姿勢與落點的投擲</small></h2></div>
+      <div class="table-wrap"><table class="corr"><thead><tr><th>指標</th><th>垂直</th><th>水平</th><th>距離</th></tr></thead><tbody id="corrRows"></tbody></table></div>
+    </article>
+  </div>
+
+  <article class="panel">
+    <div class="panel-head"><h2>教練建議</h2></div>
+    <div id="insights" class="insights"></div>
+  </article>
+</section>
+
+<dialog id="replayDlg" class="dlg wide">
+  <div class="dlg-head"><h2 id="replayTitle">動作回放</h2><button class="ghost small" data-close>關閉</button></div>
+  <div class="replay">
+    <canvas id="replayCanvas"></canvas>
+    <div class="replay-ctrls">
+      <button id="replayPlay" class="primary small">播放</button>
+      <input type="range" id="replaySeek" min="0" max="0" value="0" aria-label="回放進度">
+      <select id="replayRate" aria-label="回放速度"><option value="0.1">0.1×</option><option value="0.25" selected>0.25×</option><option value="0.5">0.5×</option><option value="1">1×</option></select>
+      <span id="replayInfo" class="muted"></span>
+    </div>
+    <canvas id="replayChart" class="chart short"></canvas>
+  </div>
+</dialog>
+
+<dialog id="settingsDlg" class="dlg">
+  <div class="dlg-head"><h2>設定</h2><button class="ghost small" data-close>關閉</button></div>
+  <div class="form">
+    <label>投擲手 <select id="setSide"><option value="auto">自動判斷</option><option value="R">右手</option><option value="L">左手</option></select></label>
+    <label>姿勢模型 <select id="setModel"><option value="lite">Lite（最快）</option><option value="full">Full（平衡）</option><option value="heavy">Heavy（最準、較慢）</option></select></label>
+    <label>出手偵測門檻（手肘角速度 °/s）<input type="range" id="setVel" min="150" max="900" step="10"><output id="setVelOut"></output></label>
+    <label>影片慢動作倍率 <select id="setSlowmo"><option value="1">一般速度影片</option><option value="4">120fps 慢動作 (×4)</option><option value="8">240fps 慢動作 (×8)</option></select></label>
+    <hr>
+    <label>落點尖端判定（依鏡頭位置） <select id="setTip">
+      <option value="top">取變化區最上緣（鏡頭在靶下方）</option>
+      <option value="bottom">取變化區最下緣（鏡頭在靶上方）</option>
+      <option value="left">取最左緣（鏡頭在靶右側）</option>
+      <option value="right">取最右緣（鏡頭在靶左側）</option>
+      <option value="center">取中心（鏡頭正對靶）</option>
+    </select></label>
+    <label>靶面變化門檻（色差，越小越靈敏）<input type="range" id="setDiff" min="10" max="60" step="1"><output id="setDiffOut"></output></label>
+    <label>每輪鏢數（滿了自動提醒拔鏢）<select id="setDarts"><option value="3">3</option><option value="6">6</option><option value="9">9</option></select></label>
+    <hr>
+    <button id="btnClearAll" class="danger">清除全部紀錄</button>
+  </div>
+</dialog>
+
+<dialog id="helpDlg" class="dlg">
+  <div class="dlg-head"><h2>使用說明</h2><button class="ghost small" data-close>關閉</button></div>
+  <div class="help">
+    <h3>1. 架設鏡頭</h3>
+    <ul>
+      <li><b>解析度 / FPS</b>：在每個鏡頭標題旁調整，執行中也能直接切換。姿勢鏡頭建議 720p、FPS 越高越好；靶面鏡頭建議提高解析度、30fps 即可。鏡頭做不到時會自動用最接近的設定，實際數值顯示在鏡頭畫面上方。</li>
+      <li><b>姿勢鏡頭</b>：放在投擲手那一側，鏡頭與投擲方向垂直、約肩膀高度，距離 2～3 公尺，讓肩、肘、腕、頭都在畫面中。</li>
+      <li><b>靶面鏡頭</b>（選用）：盡量正對鏢靶，固定不動。也可放在靶下方或側邊斜拍，系統會用 4 點校正修正透視。</li>
+      <li>兩支鏡頭同時使用時，系統會把「動作」與「落點」自動配對，算出哪個動作指標影響落點。</li>
+    </ul>
+    <h3>2. 校正靶面</h3>
+    <ol>
+      <li>按「校正靶面」，依序點擊雙倍環外緣的 4 個點：20 正上、6 正右、3 正下、11 正左。</li>
+      <li>黃色格線會疊在靶上，拖曳黃點直到格線與實際靶面重合，按「完成校正」。</li>
+    </ol>
+    <h3>3. 投擲</h3>
+    <ul>
+      <li>每次後拉→出手會自動被偵測為一投，畫面閃一下並記錄動作指標。</li>
+      <li>飛鏢插上靶後畫面靜止約 0.4 秒，系統以背景差分找出新飛鏢並計分。紅圈可拖曳修正，也可直接點畫面手動標記。</li>
+      <li>拔鏢後按「拔鏢 / 重設背景」（或鍵盤 R）。</li>
+    </ul>
+    <h3>4. 看分析</h3>
+    <ul>
+      <li>在「投擲紀錄」按 ▶ 可以慢動作回放該投的骨架與手肘角度曲線。</li>
+      <li>動作指標的「一致性」比數值本身更重要：同樣的動作才能得到同樣的落點。</li>
+      <li>資料保存在本機瀏覽器，可匯出 CSV / JSON。</li>
+    </ul>
+    <p class="muted small">姿勢辨識使用 Google MediaPipe Pose（首次載入需連網下載模型）。影像只在你的電腦上處理，不會上傳。</p>
+  </div>
+</dialog>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script src="js/math.js" defer></script>
+<script src="js/board.js" defer></script>
+<script src="js/pose.js" defer></script>
+<script src="js/analysis.js" defer></script>
+<script src="js/charts.js" defer></script>
+<script src="js/app.js" defer></script>
+</body>
+</html>
