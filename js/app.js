@@ -6,7 +6,7 @@ const newId = () => Math.random().toString(36).slice(2, 10) + Date.now().toStrin
 
 // 每個指標「標準差」的穩定 / 不穩門檻
 const SD_BANDS = {
-  aimJitter: [1, 3], cockAngle: [5, 12], releaseElbow: [6, 14], followAngle: [5, 12], peakAngVel: [80, 220],
+  aimJitter: [1, 3], cockAngle: [5, 12], releaseElbow: [6, 14], wristAngle: [6, 14], followAngle: [5, 12], peakAngVel: [80, 220],
   wristPeak: [0.5, 1.5], releaseAngle: [3, 8], releaseHeight: [0.08, 0.2], elbowRise: [4, 10], elbowDisp: [5, 12],
   shoulderDisp: [3, 8], headDisp: [3, 8], backswingMs: [40, 110], accelMs: [15, 40], rhythmMs: [50, 130],
 };
@@ -15,6 +15,7 @@ const METRIC = Object.fromEntries(FORM_METRICS.map(m => [m.key, m]));
 const DEFAULTS = {
   side: 'auto', model: 'lite', velThresh: 320, slowmo: 1, tip: 'top', diff: 28, darts: 3,
   poseRes: '1280x720', poseFps: 60, boardRes: '1280x720', boardFps: 30,
+  gateHits: true, voice: true, beep: true,
   target: 'T20', scope: 'session', trendMetric: 'releaseAngle', corrMetric: 'releaseAngle', corrAxis: 'up',
 };
 const state = { throws: [], sessionId: newId(), settings: { ...DEFAULTS }, calib: {}, selectedId: null };
@@ -169,7 +170,13 @@ const pose = {
   stream: null, file: false, running: false, lm: null, lmLoading: null,
   analyzer: new ThrowAnalyzer(), lastTs: 0, lastTA: -Infinity, frames: [], lastBmpT: -Infinity,
   fpsTimes: [], lastLm: null, live: null,
+  offline: false, offlineCancel: false, offlineThrows: 0, // 逐格分析
+  hist: [], throwMarks: [], lastChartDraw: 0,              // 即時曲線
+  unmatched: [],                                           // 尚未對到落點的出手時間（落點過濾用）
 };
+function resetPoseAnalysis() {
+  pose.analyzer.reset(); clearFrames(); pose.hist = []; pose.throwMarks = []; pose.lastTA = -Infinity;
+}
 
 async function ensureModel() {
   if (pose.lm) return pose.lm;
@@ -210,7 +217,8 @@ async function startPose(fileUrl) {
   ensureModel().catch(() => {});
 }
 function stopPose() {
-  pose.running = false;
+  pose.offlineCancel = true; pose.offline = false; offlineUI(false);
+  pose.running = false; pose.unmatched = [];
   stopStream(pose);
   clearFrames();
   pose.stage.classList.remove('active');
@@ -231,14 +239,25 @@ function schedulePose() {
 
 function onPoseFrame(now, meta) {
   const v = pose.video;
-  if (!pose.running || v.readyState < 2 || !v.videoWidth) return;
+  if (!pose.running || pose.offline || v.readyState < 2 || !v.videoWidth) return;
   const slow = +state.settings.slowmo || 1;
   const t = pose.file ? (meta?.mediaTime ?? v.currentTime) / slow : now / 1000;
-  if (t < pose.lastTA - 0.02) { pose.analyzer.reset(); clearFrames(); }
+  if (t < pose.lastTA - 0.02) resetPoseAnalysis();
   if (t === pose.lastTA) return;
   pose.lastTA = t;
+  processPoseFrame(t, now);
+  if (pose.file) updateFileBar();
+}
+function updateFileBar() {
+  const v = pose.video;
+  $('poseSeek').value = v.duration ? Math.round(v.currentTime / v.duration * 1000) : 0;
+  $('poseTime').textContent = v.currentTime.toFixed(2) + 's';
+}
 
-  let lmPx = null;
+// 分析一格：姿勢偵測 → 回放緩衝 → 出手判定 → 畫面更新；回傳影格擷取的 Promise
+function processPoseFrame(t, now) {
+  const v = pose.video;
+  let lmPx = null, bmpDone = Promise.resolve();
   if (pose.lm) {
     const ts = Math.max(pose.lastTs + 1, performance.now()); pose.lastTs = ts;
     try {
@@ -255,7 +274,7 @@ function onPoseFrame(now, meta) {
     const entry = { t, lm: lmPx, bmp: null, vw: v.videoWidth, vh: v.videoHeight };
     pose.frames.push(entry);
     const W = 360, H = Math.round(W * v.videoHeight / v.videoWidth);
-    createImageBitmap(v, { resizeWidth: W, resizeHeight: H, resizeQuality: 'low' })
+    bmpDone = createImageBitmap(v, { resizeWidth: W, resizeHeight: H, resizeQuality: 'low' })
       .then(b => { if (entry.dead) b.close(); else entry.bmp = b; }).catch(() => {});
   }
   while (pose.frames.length && pose.frames[0].t < t - 2.6) {
@@ -265,13 +284,139 @@ function onPoseFrame(now, meta) {
   const { live, thrown } = pose.analyzer.push(t, lmPx);
   pose.live = live;
   pose.fpsTimes.push(now); while (pose.fpsTimes.length && pose.fpsTimes[0] < now - 1000) pose.fpsTimes.shift();
+  if (live.valid) pose.hist.push({ t, angle: live.angle, angVel: live.angVel, hand: live.handSpeed });
+  while (pose.hist.length && pose.hist[0].t < t - 4) pose.hist.shift();
   updateLive(live);
   drawPose(lmPx, live);
   if (thrown) onThrowDetected(thrown);
-  if (pose.file) {
-    $('poseSeek').value = v.duration ? Math.round(v.currentTime / v.duration * 1000) : 0;
-    $('poseTime').textContent = v.currentTime.toFixed(1) + 's';
+  if (pose.offline || now - pose.lastChartDraw > 33) { pose.lastChartDraw = now; drawLiveChart(t); }
+  return bmpDone;
+}
+
+// ---------- 即時曲線（最近 4 秒） ----------
+function drawLiveChart(tNow) {
+  const c = $('liveChart'); if (!c) return;
+  const dpr = window.devicePixelRatio || 1, w = c.clientWidth || 300, h = c.clientHeight || 120;
+  if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+  const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+  const pad = { l: 34, r: 46, t: 6, b: 16 }, W = w - pad.l - pad.r, H = h - pad.t - pad.b;
+  const t0 = tNow - 4;
+  const X = t => pad.l + (t - t0) / 4 * W;
+  const YA = a => pad.t + (1 - a / 180) * H;                     // 手肘角 0–180°
+  const VMIN = -1000, VMAX = 2000;
+  const YV = v => pad.t + (1 - (Math.max(VMIN, Math.min(VMAX, v)) - VMIN) / (VMAX - VMIN)) * H; // 角速度
+  const HMAX = 25;
+  const YH = sp => pad.t + (1 - Math.min(HMAX, sp) / HMAX) * H;    // 手部速度（臂長/s）
+  g.font = '10px system-ui'; g.lineWidth = 1;
+  g.strokeStyle = '#222c38'; g.fillStyle = '#8a97a6'; g.textAlign = 'right'; g.textBaseline = 'middle';
+  for (const a of [0, 90, 180]) { g.beginPath(); g.moveTo(pad.l, YA(a)); g.lineTo(w - pad.r, YA(a)); g.stroke(); g.fillText(a + '°', pad.l - 4, YA(a)); }
+  g.textAlign = 'left';
+  for (const v of [0, 1000, 2000]) g.fillText(v + '°/s', w - pad.r + 4, YV(v));
+  g.textAlign = 'center'; g.textBaseline = 'top';
+  for (let k = 0; k <= 4; k++) g.fillText(k === 4 ? '現在' : `-${4 - k}s`, pad.l + k / 4 * W, h - pad.b + 3);
+  // 出手門檻
+  g.strokeStyle = '#ff8a5b'; g.setLineDash([3, 3]);
+  g.beginPath(); g.moveTo(pad.l, YV(state.settings.velThresh)); g.lineTo(w - pad.r, YV(state.settings.velThresh)); g.stroke(); g.setLineDash([]);
+  // 已偵測的出手
+  for (const tm of pose.throwMarks) {
+    if (tm < t0 || tm > tNow) continue;
+    g.strokeStyle = 'rgba(242,178,51,.8)'; g.beginPath(); g.moveTo(X(tm), pad.t); g.lineTo(X(tm), pad.t + H); g.stroke();
+    g.fillStyle = '#f2b233'; g.textAlign = 'left'; g.textBaseline = 'top'; g.fillText('出手', X(tm) + 3, pad.t);
   }
+  const line = (key, Y, color, width) => {
+    g.strokeStyle = color; g.lineWidth = width; g.beginPath(); let started = false, lastT = -Infinity;
+    for (const pt of pose.hist) {
+      if (pt.t < t0 || !Number.isFinite(pt[key])) continue;
+      const x = X(pt.t), y = Y(pt[key]);
+      if (!started || pt.t - lastT > 0.25) { g.moveTo(x, y); started = true; } else g.lineTo(x, y);
+      lastT = pt.t;
+    }
+    g.stroke();
+  };
+  line('hand', YH, 'rgba(43,196,166,.8)', 1.2);
+  line('angVel', YV, '#f2b233', 1.4);
+  line('angle', YA, '#5aa8ff', 2);
+}
+
+// ---------- 逐格分析影片檔 ----------
+async function probeVideoFps(v) {
+  // 播放一小段，用「已解碼影格數 ÷ 播放時間」推算原始 FPS（掉格也會被計入，所以不受電腦效能影響）
+  const COMMON = [24, 25, 30, 48, 50, 60, 90, 100, 120, 180, 240, 480, 960];
+  const snap = f => COMMON.find(c => Math.abs(f - c) / c < 0.07) || Math.round(f);
+  const rate = v.playbackRate;
+  let est = NaN;
+  if (v.getVideoPlaybackQuality) {
+    await seekFrame(v, 0);
+    v.playbackRate = 1;
+    const q0 = v.getVideoPlaybackQuality().totalVideoFrames, c0 = v.currentTime;
+    await v.play().catch(() => {});
+    const want = Math.min(1.2, v.duration * 0.6), tStart = performance.now();
+    while (v.currentTime - c0 < want && performance.now() - tStart < 3000) await new Promise(r => setTimeout(r, 50));
+    v.pause();
+    const frames = v.getVideoPlaybackQuality().totalVideoFrames - q0, span = v.currentTime - c0;
+    if (frames > 5 && span > 0.1) est = frames / span;
+  }
+  v.playbackRate = rate;
+  return Number.isFinite(est) ? Math.max(1, Math.min(1000, snap(est))) : 30;
+}
+function seekFrame(v, time) {
+  return new Promise(res => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; res(); } };
+    const onSeeked = () => {
+      v.removeEventListener('seeked', onSeeked);
+      if ('requestVideoFrameCallback' in v) { v.requestVideoFrameCallback(finish); setTimeout(finish, 80); } else finish();
+    };
+    v.addEventListener('seeked', onSeeked);
+    v.currentTime = time;
+    setTimeout(finish, 2000); // 保險：避免卡住
+  });
+}
+function offlineUI(on, text, frac) {
+  $('poseOfflineInfo').hidden = !on;
+  if (text != null) $('poseOfflineText').textContent = text;
+  if (frac != null) $('poseOfflineBar').style.width = (frac * 100).toFixed(1) + '%';
+  $('poseOffline').textContent = pose.offline ? '停止分析' : '逐格分析';
+  for (const id of ['posePlay', 'poseSeek', 'poseRate']) $(id).disabled = pose.offline;
+}
+async function analyzeVideoOffline() {
+  const v = pose.video;
+  if (pose.offline) { pose.offlineCancel = true; return; }
+  if (!pose.file || !v.duration) { toast('請先用「影片檔」載入影片'); return; }
+  try { await ensureModel(); } catch { return; }
+  if (!Number.isFinite(v.duration)) {
+    // 部分錄影檔（如 WebM）沒有寫入長度：跳到極遠處讓瀏覽器算出實際長度
+    await new Promise(res => { const ok = () => res(); v.addEventListener('durationchange', ok, { once: true }); v.currentTime = 1e7; setTimeout(ok, 3000); });
+    await seekFrame(v, 0);
+    if (!Number.isFinite(v.duration)) { toast('無法取得影片長度，請改用 MP4 影片'); return; }
+  }
+  pose.offline = true; pose.offlineCancel = false; pose.offlineThrows = 0;
+  v.pause(); $('posePlay').textContent = '播放';
+  const manualFps = +$('poseVideoFps').value;
+  offlineUI(true, manualFps ? `使用手動指定 ${manualFps} fps` : '偵測影片 FPS…', 0);
+  const fps = manualFps > 0 ? manualFps : await probeVideoFps(v), dt = 1 / fps;
+  if (!manualFps) $('poseVideoFps').placeholder = `自動（${fps}）`;
+  const slow = +state.settings.slowmo || 1;
+  const total = Math.max(1, Math.floor(v.duration * fps));
+  resetPoseAnalysis();
+  const t0 = performance.now();
+  let i = 0;
+  for (; i < total && !pose.offlineCancel; i++) {
+    await seekFrame(v, Math.min(v.duration - 1e-3, (i + 0.5) * dt));
+    if (pose.offlineCancel) break;
+    await processPoseFrame(i * dt / slow, performance.now());
+    if (i % 4 === 0) {
+      const el = (performance.now() - t0) / 1000, eta = el / (i + 1) * (total - i - 1);
+      offlineUI(true, `影片 ${fps} fps · 第 ${i + 1} / ${total} 格 · 已偵測 ${pose.offlineThrows} 投 · 約剩 ${Math.ceil(eta)} 秒`, (i + 1) / total);
+      updateFileBar();
+    }
+  }
+  const cancelled = pose.offlineCancel;
+  pose.offline = false;
+  if (!pose.running) return; // 分析途中鏡頭被關掉
+  offlineUI(true, `${cancelled ? '已停止' : '分析完成'}：影片 ${fps} fps，分析 ${i} 格，偵測到 ${pose.offlineThrows} 投${slow > 1 ? `（慢動作 ×${slow}）` : ''}`, i / total);
+  toast(`逐格分析${cancelled ? '已停止' : '完成'}：偵測到 ${pose.offlineThrows} 投`);
+  pose.analyzer.reset(); pose.lastTA = -Infinity;
 }
 
 function updateLive(live) {
@@ -330,7 +475,46 @@ function onThrowDetected(th) {
     for (const f of c.frames) { f.kept = false; if (!pose.frames.includes(f)) { f.dead = true; f.bmp?.close(); } }
   }
   flash('poseFlash', `第 ${rec.no} 投`);
+  pose.throwMarks.push(tRel);
+  if (pose.offline) pose.offlineThrows++;
+  else { pose.unmatched.push(performance.now()); if (state.settings.beep) beep(); }
   renderAll();
+}
+
+// ---------- 聲音 ----------
+let audioCtx = null;
+function beep() {
+  try {
+    audioCtx ||= new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const o = audioCtx.createOscillator(), gn = audioCtx.createGain(), t = audioCtx.currentTime;
+    o.frequency.value = 1046; o.type = 'sine';
+    gn.gain.setValueAtTime(0.0001, t); gn.gain.exponentialRampToValueAtTime(0.25, t + 0.01); gn.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+    o.connect(gn).connect(audioCtx.destination); o.start(t); o.stop(t + 0.13);
+  } catch { /* 不支援就略過 */ }
+}
+let zhVoice = null;
+function pickVoice() {
+  if (!('speechSynthesis' in window)) return;
+  const vs = speechSynthesis.getVoices();
+  zhVoice = vs.find(v => /zh[-_]TW/i.test(v.lang)) || vs.find(v => /zh[-_](HK|Hant)/i.test(v.lang)) || vs.find(v => /^zh/i.test(v.lang)) || null;
+}
+if ('speechSynthesis' in window) { pickVoice(); speechSynthesis.addEventListener?.('voiceschanged', pickVoice); }
+function say(text, force) {
+  if ((!state.settings.voice && !force) || !('speechSynthesis' in window)) return;
+  const u = new SpeechSynthesisUtterance(text);
+  if (zhVoice) u.voice = zhVoice;
+  u.lang = zhVoice?.lang || 'zh-TW'; u.rate = 1.15;
+  speechSynthesis.speak(u);
+}
+function hitWords(hit) {
+  if (hit.label === 'BULL') return '紅心，50分';
+  if (hit.label === '25') return '外紅心，25分';
+  if (hit.label === 'MISS') return '出界';
+  const n = hit.label.slice(1);
+  if (hit.label[0] === 'T') return `三倍${n}，${hit.score}分`;
+  if (hit.label[0] === 'D') return `雙倍${n}，${hit.score}分`;
+  return `${n}分`;
 }
 
 // ---------- 配對 動作 ↔ 落點 ----------
@@ -359,13 +543,18 @@ function makeHit(mm, manual, src) {
 const boardSrc = { video: $('boardVideo'), stage: $('boardStage'), stream: null, running: false, key: '' };
 const board = new BoardCam($('boardVideo'), $('boardOverlay'), {
   onHit(img, mm, meta) {
-    const hit = makeHit(mm, meta.manual, 'cam');
-    const rec = attach('hit', hit, meta.manual ? 20000 : 3500);
-    board.markers.push({ id: rec.id, img, label: hit.label, manual: meta.manual });
-    flash('boardFlash', `${hit.label}  ${hit.score} 分`);
-    const full = board.markers.length >= +state.settings.darts;
-    boardStatus(full ? `本輪已投 ${board.markers.length} 鏢，拔鏢後按「拔鏢 / 重設背景」（R）` : `第 ${board.markers.length} 鏢：${hit.label}（${meta.manual ? '手動' : '自動'}）· 紅圈可拖曳修正`, full ? 'warn' : 'ok');
-    renderAll();
+    if (!meta.manual && gateActive()) {
+      const now = performance.now();
+      pose.unmatched = pose.unmatched.filter(t => now - t < 6000);
+      if (!pose.unmatched.length) {
+        pendingReject = { img, mm };
+        $('btnAcceptHit').hidden = false;
+        boardStatus('已忽略一個變化：這段時間沒有偵測到出手（可能是影子或光線）。如果真的是一鏢，按「仍要記錄」', 'warn');
+        return;
+      }
+      pose.unmatched.shift();
+    }
+    acceptBoardHit(img, mm, meta.manual);
   },
   onHitMoved(id, mm) {
     const rec = state.throws.find(r => r.id === id);
@@ -377,6 +566,24 @@ const board = new BoardCam($('boardVideo'), $('boardOverlay'), {
   onStatus: (t, l) => boardStatus(t, l),
   onCalibChange() { state.calib[boardSrc.key] = board.calib; save(); updateBoardButtons(); },
 });
+let pendingReject = null;
+// 姿勢鏡頭正在即時偵測時，才用「有出手」來過濾靶面變化
+function gateActive() { return state.settings.gateHits && pose.running && !pose.file && !!pose.lm; }
+function acceptBoardHit(img, mm, manual) {
+  pendingReject = null; $('btnAcceptHit').hidden = true;
+  const hit = makeHit(mm, manual, 'cam');
+  const rec = attach('hit', hit, manual ? 20000 : 3500);
+  board.markers.push({ id: rec.id, img, label: hit.label, manual });
+  flash('boardFlash', `${hit.label}  ${hit.score} 分`);
+  const full = board.markers.length >= +state.settings.darts;
+  boardStatus(full ? `本輪已投 ${board.markers.length} 鏢，拔鏢後按「拔鏢 / 重設背景」（R）` : `第 ${board.markers.length} 鏢：${hit.label}（${manual ? '手動' : '自動'}）· 紅圈可拖曳修正`, full ? 'warn' : 'ok');
+  say(hitWords(hit));
+  if (board.markers.length === +state.settings.darts) {
+    const total = board.markers.reduce((sum, m) => sum + (state.throws.find(r => r.id === m.id)?.hit?.score || 0), 0);
+    say(`本輪 ${total} 分`);
+  }
+  renderAll();
+}
 function boardStatus(text, level) { const s = $('boardStatus'); s.textContent = text; s.className = 'status ' + (level || ''); }
 function updateBoardButtons() {
   $('btnCalib').disabled = !boardSrc.running;
@@ -423,6 +630,7 @@ function boardLoop() {
 }
 function pullDarts() {
   board.clearMarkers(); board.resetReference();
+  pendingReject = null; $('btnAcceptHit').hidden = true;
   boardStatus('已重設背景，等待下一輪', 'info');
 }
 
@@ -696,6 +904,13 @@ function bind() {
   $('posePlay').onclick = () => { const v = pose.video; if (v.paused) { v.play(); $('posePlay').textContent = '暫停'; } else { v.pause(); $('posePlay').textContent = '播放'; } };
   $('poseRate').onchange = e => (pose.video.playbackRate = +e.target.value);
   $('poseSeek').oninput = e => { const v = pose.video; if (v.duration) v.currentTime = e.target.value / 1000 * v.duration; };
+  $('poseOffline').onclick = analyzeVideoOffline;
+  $('btnAcceptHit').onclick = () => { if (pendingReject) acceptBoardHit(pendingReject.img, pendingReject.mm, true); };
+  for (const [id, key] of [['setGate', 'gateHits'], ['setVoice', 'voice'], ['setBeep', 'beep']]) {
+    $(id).checked = !!state.settings[key];
+    $(id).onchange = e => { state.settings[key] = e.target.checked; save(); };
+  }
+  $('btnTestVoice').onclick = () => { beep(); say('三倍20，60分', true); if (!zhVoice) toast('找不到中文語音，會用預設語音（可在 Windows 設定 → 時間與語言 → 語音 新增中文語音）'); };
 
   $('btnCalib').onclick = () => { board.startCalibration(); updateBoardButtons(); };
   $('btnCalibDone').onclick = () => { board.finishCalibration(); updateBoardButtons(); };
@@ -738,6 +953,7 @@ function bind() {
     const hit = makeHit([p.x, p.y], true, 'plot');
     const rec = attach('hit', hit, 20000);
     toast(`#${rec.no} 記錄 ${hit.label}（${hit.score} 分）`);
+    say(hitWords(hit));
     renderAll();
   });
 
@@ -776,7 +992,7 @@ function bind() {
   setup('setSide', 'side', () => pose.analyzer.setOpts({ side: S.side }));
   setup('setModel', 'model', () => { pose.lm?.close?.(); pose.lm = null; if (pose.running) ensureModel().catch(() => {}); else chip('chipModel', '姿勢模型：未載入'); });
   setup('setVel', 'velThresh', () => pose.analyzer.setOpts({ velThresh: S.velThresh }), 'setVelOut');
-  setup('setSlowmo', 'slowmo', () => { pose.analyzer.reset(); clearFrames(); pose.lastTA = -Infinity; });
+  setup('setSlowmo', 'slowmo', () => resetPoseAnalysis());
   setup('setTip', 'tip', () => (board.tipMode = S.tip));
   setup('setDiff', 'diff', () => (board.diffThresh = S.diff), 'setDiffOut');
   setup('setDarts', 'darts');
@@ -825,4 +1041,4 @@ renderAll();
 if (!window.isSecureContext) toast('目前的網址不被允許使用攝影機，請改用 start.bat 開啟（http://localhost）');
 
 // 測試 / 除錯用
-window.__dartlab = { state, pose, board, attach, onThrowDetected, renderAll, ThrowAnalyzer };
+window.__dartlab = { state, pose, board, attach, onThrowDetected, renderAll, ThrowAnalyzer, processPoseFrame, analyzeVideoOffline, acceptBoardHit, hitWords, drawLiveChart, resetPoseAnalysis };

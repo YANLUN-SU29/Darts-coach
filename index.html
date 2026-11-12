@@ -52,6 +52,11 @@
         <input type="range" id="poseSeek" min="0" max="1000" value="0" aria-label="影片進度">
         <select id="poseRate" aria-label="播放速度"><option value="0.25">0.25×</option><option value="0.5" selected>0.5×</option><option value="1">1×</option></select>
         <span class="muted" id="poseTime">0.0s</span>
+        <input type="number" id="poseVideoFps" class="fps-input" min="1" max="1000" step="1" placeholder="自動" title="影片的原始 FPS；留空會自動偵測。若偵測結果不對，可手動輸入（例如 240）" aria-label="影片 FPS">
+        <button id="poseOffline" class="primary small" title="一格一格分析整支影片，不會漏格（適合手機慢動作影片）">逐格分析</button>
+      </div>
+      <div class="offline-info" id="poseOfflineInfo" hidden>
+        <i><em id="poseOfflineBar"></em></i><span id="poseOfflineText"></span>
       </div>
       <div class="strip">
         <div><span>投擲手</span><b id="lvSide">—</b></div>
@@ -60,6 +65,10 @@
         <div><span>階段</span><b id="lvPhase">—</b></div>
         <div><span>分析 FPS</span><b id="lvFps">—</b></div>
         <div class="meter"><span>手肘角</span><i><em id="lvBar"></em></i></div>
+      </div>
+      <div class="live-chart-wrap">
+        <div class="live-legend"><span><i style="background:#5aa8ff"></i>手肘角</span><span><i style="background:#f2b233"></i>手肘角速度</span><span><i style="background:#2bc4a6"></i>手部速度</span><span><i class="dash"></i>出手門檻</span></div>
+        <canvas id="liveChart" class="live-chart"></canvas>
       </div>
     </article>
 
@@ -88,6 +97,7 @@
         <button id="btnCalib" class="ghost small" disabled>校正靶面</button>
         <button id="btnCalibDone" class="primary small" hidden>完成校正</button>
         <button id="btnPull" class="ghost small" disabled title="快捷鍵 R">拔鏢 / 重設背景</button>
+        <button id="btnAcceptHit" class="primary small" hidden title="剛才被忽略的變化其實是一鏢">仍要記錄</button>
         <label class="toggle"><input type="checkbox" id="autoDetect" checked> 自動偵測</label>
         <span class="status" id="boardStatus">尚未啟動</span>
       </div>
@@ -230,6 +240,11 @@
     </select></label>
     <label>靶面變化門檻（色差，越小越靈敏）<input type="range" id="setDiff" min="10" max="60" step="1"><output id="setDiffOut"></output></label>
     <label>每輪鏢數（滿了自動提醒拔鏢）<select id="setDarts"><option value="3">3</option><option value="6">6</option><option value="9">9</option></select></label>
+    <label class="toggle"><input type="checkbox" id="setGate"> 只在偵測到出手後才記錄落點（姿勢鏡頭開啟時生效，可避免影子、光線變化被當成一鏢）</label>
+    <hr>
+    <label class="toggle"><input type="checkbox" id="setVoice"> 語音報分（每鏢唸出落點與分數，每輪結束唸出總分）</label>
+    <label class="toggle"><input type="checkbox" id="setBeep"> 偵測到出手時發出提示音</label>
+    <button id="btnTestVoice" class="ghost small" style="align-self:flex-start">測試語音</button>
     <hr>
     <button id="btnClearAll" class="danger">清除全部紀錄</button>
   </div>
@@ -255,6 +270,9 @@
       <li>每次後拉→出手會自動被偵測為一投，畫面閃一下並記錄動作指標。</li>
       <li>飛鏢插上靶後畫面靜止約 0.4 秒，系統以背景差分找出新飛鏢並計分。紅圈可拖曳修正，也可直接點畫面手動標記。</li>
       <li>拔鏢後按「拔鏢 / 重設背景」（或鍵盤 R）。</li>
+      <li>姿勢鏡頭開啟時，靶面只接受「剛偵測到出手後」出現的變化。若真的一鏢被忽略了，按「仍要記錄」補上（可在設定關閉此功能）。</li>
+      <li>姿勢鏡頭下方的即時曲線：藍線是手肘角，黃線是手肘角速度，黃線超過虛線門檻就會判定為出手。沒偵測到時，可從這裡看出是門檻太高還是骨架沒抓到。</li>
+      <li><b>手機慢動作影片</b>：用「影片檔」載入後按「逐格分析」，會一格一格分析整支影片，不會漏格。記得在設定選對慢動作倍率。</li>
     </ul>
     <h3>4. 看分析</h3>
     <ul>

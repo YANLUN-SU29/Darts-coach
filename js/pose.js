@@ -35,10 +35,11 @@ const SKELETON = [[11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [1
 const FORM_METRICS = [
   { key: 'aimJitter', name: '瞄準時手腕晃動', unit: '%', d: 1, better: 'low', tip: '出手前 0.5 秒手腕位置的均方根晃動（相對前臂長）' },
   { key: 'cockAngle', name: '後拉最小手肘角', unit: '°', d: 0, tip: '後拉到最深時的手肘夾角' },
-  { key: 'releaseElbow', name: '出手瞬間手肘角', unit: '°', d: 0, tip: '角速度最大（推定出手）時的手肘夾角' },
+  { key: 'releaseElbow', name: '出手瞬間手肘角', unit: '°', d: 0, tip: '推定出手瞬間（手部速度最快時）的手肘夾角' },
+  { key: 'wristAngle', name: '出手時手腕角', unit: '°', d: 0, tip: '手肘—手腕—食指的夾角，180° = 手腕打直，越小代表手腕彎得越多（側拍時僅供參考）' },
   { key: 'followAngle', name: '跟隨延伸角', unit: '°', d: 0, better: 'high', tip: '出手後 0.4 秒內手肘最大夾角，170° 以上代表手臂完整延伸' },
   { key: 'peakAngVel', name: '手肘峰值角速度', unit: '°/s', d: 0, tip: '手肘伸展最快的速度，反映出手力道' },
-  { key: 'wristPeak', name: '手腕峰值速度', unit: '臂長/s', d: 2, tip: '以上臂長為單位的手腕線速度' },
+  { key: 'wristPeak', name: '手部峰值速度', unit: '臂長/s', d: 2, tip: '食指 / 手腕的最大線速度（以上臂長為單位）；出手時機就是以這個峰值推定' },
   { key: 'releaseAngle', name: '前臂出手角', unit: '°', d: 1, tip: '出手瞬間前臂相對水平線的仰角（正值朝上）' },
   { key: 'releaseHeight', name: '出手高度（相對肩）', unit: '臂長', d: 2, tip: '出手時手腕高於肩膀多少個上臂長' },
   { key: 'elbowRise', name: '出手時手肘升降', unit: '%', d: 1, tip: '從後拉最深到出手，手肘垂直位移（上臂長 %，正值 = 上升）' },
@@ -51,6 +52,22 @@ const FORM_METRICS = [
 ];
 
 const P = (lm, i) => (lm && lm[i]) ? [lm[i].x, lm[i].y] : null;
+
+// 手部代表點：食指點離手腕太遠（偵測錯誤）時改用手腕
+function handOf(f, fore) {
+  if (!f.idx) return f.wr;
+  const lim = 0.6 * (fore || dist(f.el, f.wr));
+  return dist(f.idx, f.wr) < lim ? f.idx : f.wr;
+}
+// 在影格序列中，依時間 t 線性內插某個欄位（數值或 [x,y]）
+function interpAt(F, t, key) {
+  const i = F.findIndex(f => f.t >= t);
+  if (i < 0) return F[F.length - 1][key];
+  if (i === 0) return F[0][key];
+  const a = F[i - 1], b = F[i], u = (t - a.t) / (b.t - a.t || 1);
+  const va = a[key], vb = b[key];
+  return Array.isArray(va) ? [va[0] + (vb[0] - va[0]) * u, va[1] + (vb[1] - va[1]) * u] : va + (vb - va) * u;
+}
 
 class ThrowAnalyzer {
   constructor(opts = {}) {
@@ -90,10 +107,12 @@ class ThrowAnalyzer {
     f.angle = jointAngle(f.sh, f.el, f.wr);
     const prev = this._lastValid();
     f.angVel = prev && t > prev.t ? (f.angle - prev.angle) / (t - prev.t) : 0;
+    const upperNow = dist(f.sh, f.el);
+    f.handSpeed = prev && t > prev.t && upperNow > 5 ? dist(handOf(f), handOf(prev)) / (t - prev.t) / upperNow : 0;
     this.buf.push(f);
     this._trim(t);
 
-    live = { t, valid: f.valid, side: this.side, angle: f.angle, angVel: f.angVel, vis };
+    live = { t, valid: f.valid, side: this.side, angle: f.angle, angVel: f.angVel, handSpeed: f.handSpeed, vis };
     live.phase = !f.valid ? '—' : f.angVel > 150 ? '出手' : f.angVel < -60 ? '後拉' : Math.abs(f.angVel) < 40 ? '瞄準' : '移動';
 
     let thrown = null;
@@ -125,11 +144,36 @@ class ThrowAnalyzer {
     const argmax = (ids, fn) => ids.reduce((b, i) => (b < 0 || fn(i) > fn(b) ? i : b), -1);
     const argmin = (ids, fn) => ids.reduce((b, i) => (b < 0 || fn(i) < fn(b) ? i : b), -1);
 
-    const iRel = argmax(range(tTrig - 0.25, tTrig + 0.3), i => av[i]);
-    if (iRel < 0) return null;
-    const tRel = F[iRel].t;
-    const iMin = argmin(range(tRel - 0.8, tRel), i => F[i].angle);
-    if (iMin < 0 || iMin >= iRel) return null;
+    const upper = median(F.map(f => dist(f.sh, f.el)));
+    const fore = median(F.map(f => dist(f.el, f.wr)));
+    if (!(upper > 5) || !(fore > 5)) return null;
+
+    // 手部線速度（食指點；若偏離手腕太遠視為誤判，改用手腕）
+    const H = F.map(f => handOf(f, fore));
+    const hs = F.map((f, i) => {
+      const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1);
+      return F[b].t > F[a].t ? dist(H[b], H[a]) / (F[b].t - F[a].t) : 0;
+    });
+    // 飛鏢離手後手部開始減速 → 手部速度峰值 ≈ 出手瞬間
+    let iRel = argmax(range(tTrig - 0.25, tTrig + 0.3), i => hs[i]);
+    let iMin = iRel >= 0 ? argmin(range(F[iRel].t - 0.8, F[iRel].t), i => F[i].angle) : -1;
+    if (iRel < 0 || iMin < 0 || iMin >= iRel) {
+      // 後備：手部點不可靠時改用手肘角速度峰值
+      iRel = argmax(range(tTrig - 0.25, tTrig + 0.3), i => av[i]);
+      if (iRel < 0) return null;
+      iMin = argmin(range(F[iRel].t - 0.8, F[iRel].t), i => F[i].angle);
+      if (iMin < 0 || iMin >= iRel) return null;
+    }
+    // 拋物線內插：在兩格之間估計真正的峰值時間（低 FPS 時特別有幫助）
+    let tRel = F[iRel].t;
+    if (iRel > 0 && iRel < n - 1) {
+      const a = hs[iRel - 1], b = hs[iRel], c = hs[iRel + 1], den = a - 2 * b + c;
+      if (den < 0) {
+        const frac = Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / den));
+        tRel = frac >= 0 ? F[iRel].t + frac * (F[iRel + 1].t - F[iRel].t) : F[iRel].t + frac * (F[iRel].t - F[iRel - 1].t);
+      }
+    }
+    const at = key => interpAt(F, tRel, key); // 出手瞬間的內插值
     // 由後拉最深處往回找：第一個「穩定且明顯高於最小角」的幀視為後拉起點
     let iStart = iMin;
     while (iStart > 0 && F[iStart - 1].t > tRel - 1.6) {
@@ -137,10 +181,6 @@ class ThrowAnalyzer {
       iStart = j;
       if (Math.abs(av[j]) < 35 && F[j].angle - F[iMin].angle > 8) break;
     }
-
-    const upper = median(F.map(f => dist(f.sh, f.el)));
-    const fore = median(F.map(f => dist(f.el, f.wr)));
-    if (!(upper > 5) || !(fore > 5)) return null;
 
     const tStart = F[iStart].t, tMin = F[iMin].t;
     const aim = range(tStart - 0.5, tStart);
@@ -154,31 +194,29 @@ class ThrowAnalyzer {
     const through = range(tMin, tRel + 0.3);
     const elRef = F[iMin].el;
     const elbowDisp = Math.max(...through.map(i => dist(F[i].el, elRef))) / upper * 100;
-    const elbowRise = (elRef[1] - F[iRel].el[1]) / upper * 100;
+    const elbowRise = (elRef[1] - at('el')[1]) / upper * 100;
     const whole = range(tStart, tRel + 0.3);
     const shoulderDisp = Math.max(...whole.map(i => dist(F[i].sh, F[iStart].sh))) / upper * 100;
     const headDisp = Math.max(...whole.map(i => dist(F[i].nose, F[iStart].nose))) / upper * 100;
 
     const ia = Math.max(0, iRel - 1), ib = Math.min(n - 1, iRel + 1);
     const dir = Math.sign(F[ib].wr[0] - F[ia].wr[0]) || Math.sign(F[iRel].wr[0] - F[iMin].wr[0]) || 1;
-    const rel = F[iRel];
+    const rel = { sh: at('sh'), el: at('el'), wr: at('wr'), hand: interpAt(F.map((f, i) => ({ t: f.t, hand: H[i] })), tRel, 'hand') };
     const releaseAngle = Math.atan2(-(rel.wr[1] - rel.el[1]), (rel.wr[0] - rel.el[0]) * dir) * 180 / Math.PI;
     const releaseHeight = (rel.sh[1] - rel.wr[1]) / upper;
-    let wristPeak = 0;
-    for (const i of range(tMin, tRel + 0.1)) {
-      if (i === 0) continue;
-      const dt = F[i].t - F[i - 1].t;
-      if (dt > 0) wristPeak = Math.max(wristPeak, dist(F[i].wr, F[i - 1].wr) / dt / upper);
-    }
+    const releaseElbow = jointAngle(rel.sh, rel.el, rel.wr);
+    const wristAngle = rel.hand !== rel.wr && dist(rel.hand, rel.wr) > 1 ? jointAngle(rel.el, rel.wr, rel.hand) : NaN;
+    const wristPeak = hs[iRel] / upper;
+    const peakAngVel = Math.max(...range(tMin, tRel + 0.15).map(i => av[i]));
     const fps = (n - 1) / (F[n - 1].t - F[0].t);
-    const curve = range(tRel - 1.0, tRel + 0.5).map(i => ({ dt: +(F[i].t - tRel).toFixed(4), angle: +F[i].angle.toFixed(1), elbowY: +((elRef[1] - F[i].el[1]) / upper * 100).toFixed(1) }));
+    const curve = range(tRel - 1.0, tRel + 0.5).map(i => ({ dt: +(F[i].t - tRel).toFixed(4), angle: +F[i].angle.toFixed(1), elbowY: +((elRef[1] - F[i].el[1]) / upper * 100).toFixed(1), hand: +(hs[i] / upper).toFixed(2) }));
     const angleRange = Math.max(...F.map(f => f.angle)) - F[iMin].angle;
     if (angleRange < 25) return null;
 
     return {
       tRel, side: this.side, dir, fps: +fps.toFixed(1),
-      aimJitter, cockAngle: F[iMin].angle, releaseElbow: rel.angle, followAngle,
-      peakAngVel: av[iRel], wristPeak, releaseAngle, releaseHeight,
+      aimJitter, cockAngle: F[iMin].angle, releaseElbow, wristAngle, followAngle,
+      peakAngVel, wristPeak, releaseAngle, releaseHeight,
       elbowRise, elbowDisp, shoulderDisp, headDisp,
       backswingMs: (tMin - tStart) * 1000, accelMs: (tRel - tMin) * 1000, rhythmMs: (tRel - tStart) * 1000,
       curve,

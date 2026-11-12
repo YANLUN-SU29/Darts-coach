@@ -163,3 +163,15 @@ td .act { padding: 1px 7px; font-size: 12px; }
 select.compact { padding: 5px 6px; }
 .caminfo { font-size: 12px; color: var(--muted); margin: -4px 0 8px; min-height: 18px; }
 .caminfo.warn { color: var(--accent); }
+
+.offline-info { display: flex; align-items: center; gap: 10px; margin-top: 6px; font-size: 12px; color: var(--muted); }
+.offline-info i { flex: 0 0 160px; height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; }
+.offline-info em { display: block; height: 100%; width: 0; background: var(--accent); }
+.live-chart-wrap { margin-top: 8px; }
+.live-legend { display: flex; gap: 12px; font-size: 11px; color: var(--muted); flex-wrap: wrap; }
+.live-legend i { display: inline-block; width: 12px; height: 3px; vertical-align: middle; margin-right: 4px; border-radius: 2px; }
+.live-legend i.dash { background: repeating-linear-gradient(90deg, #ff8a5b 0 3px, transparent 3px 5px); }
+.live-chart { width: 100%; height: 120px; display: block; }
+.form label.toggle { flex-direction: row; align-items: flex-start; gap: 8px; color: var(--text); }
+.form label.toggle input { margin-top: 3px; }
+.fps-input { width: 108px; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 4px 6px; font-size: 12px; }
